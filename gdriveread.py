@@ -1,16 +1,16 @@
 """
-Streamlit Google Drive Reader App
+Streamlit Google Drive Reader App - Fixed Version
 Web aplikasi untuk membaca file dan folder Google Drive menggunakan Google OAuth
 
 Requirements:
-pip install streamlit google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client streamlit-oauth python-docx openpyxl PyPDF2 pandas plotly
+pip install streamlit google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client python-docx openpyxl PyPDF2 pandas plotly streamlit-components-custom
 """
 
 import streamlit as st
 import os
 import io
 import json
-import tempfile
+import urllib.parse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -30,11 +30,8 @@ import csv
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Streamlit OAuth
-from streamlit_oauth import OAuth1Component, OAuth2Component
-
 class StreamlitGoogleDriveReader:
-    """Streamlit Google Drive Reader with OAuth"""
+    """Streamlit Google Drive Reader with Manual OAuth Implementation"""
     
     def __init__(self):
         self.scopes = [
@@ -44,83 +41,226 @@ class StreamlitGoogleDriveReader:
         ]
         self.service = None
         
+    def get_base_url(self):
+        """Get the base URL for the app"""
+        try:
+            # Try to detect Streamlit Cloud
+            if 'STREAMLIT_SHARING' in os.environ or 'streamlit.app' in str(st.get_option('server.baseUrlPath')):
+                # For Streamlit Cloud, construct URL from environment or use a default
+                app_name = os.environ.get('STREAMLIT_APP_NAME', 'your-app-name')
+                return f"https://{app_name}.streamlit.app"
+            else:
+                return "http://localhost:8501"
+        except:
+            return "http://localhost:8501"
+        
     def setup_oauth_config(self):
         """Setup OAuth configuration dari Streamlit secrets"""
         if 'google' not in st.secrets:
             st.error("""
             ❌ **Google OAuth belum dikonfigurasi!**
             
-            Tambahkan konfigurasi berikut ke file `.streamlit/secrets.toml`:
+            Tambahkan konfigurasi berikut ke Streamlit secrets:
             
             ```toml
             [google]
             client_id = "your-client-id.googleusercontent.com"
             client_secret = "your-client-secret"
-            redirect_uri = "http://localhost:8501"
             ```
+            
+            **Setup Instructions:**
+            1. Buka Google Cloud Console
+            2. Buat OAuth2 credentials (Web Application)
+            3. Tambahkan authorized redirect URI: `{self.get_base_url()}`
+            4. Copy client_id dan client_secret ke Streamlit secrets
             """)
             st.stop()
             
+        base_url = self.get_base_url()
+        
         return {
             'client_id': st.secrets.google.client_id,
             'client_secret': st.secrets.google.client_secret,
-            'redirect_uri': st.secrets.google.redirect_uri,
+            'redirect_uri': base_url,
             'scope': ' '.join(self.scopes)
         }
     
-    def authenticate_user(self):
-        """Handle Google OAuth authentication"""
+    def get_authorization_url(self):
+        """Generate OAuth authorization URL"""
         oauth_config = self.setup_oauth_config()
         
-        # Initialize OAuth2 component
-        oauth2 = OAuth2Component(
-            client_id=oauth_config['client_id'],
-            client_secret=oauth_config['client_secret'],
-            authorize_endpoint="https://accounts.google.com/o/oauth2/auth",
-            token_endpoint="https://oauth2.googleapis.com/token",
-            refresh_token_endpoint="https://oauth2.googleapis.com/token",
-            revoke_token_endpoint="https://oauth2.googleapis.com/revoke",
+        # Create OAuth flow
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": oauth_config['client_id'],
+                    "client_secret": oauth_config['client_secret'],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [oauth_config['redirect_uri']]
+                }
+            },
+            scopes=self.scopes
         )
         
-        # Check if user is already authenticated
-        if 'auth_token' not in st.session_state:
-            st.markdown("### 🔐 Login dengan Google untuk mengakses Drive")
-            st.info("Klik tombol di bawah untuk login dan memberikan akses ke Google Drive Anda")
-            
-            # OAuth login button
-            result = oauth2.authorize_button(
-                name="Login dengan Google",
-                icon="https://developers.google.com/identity/images/g-logo.png",
-                redirect_uri=oauth_config['redirect_uri'],
-                scope=oauth_config['scope'],
-                key="google_auth",
-                extras_params={"access_type": "offline", "prompt": "consent"}
-            )
-            
-            if result and 'token' in result:
-                st.session_state.auth_token = result['token']
-                st.session_state.user_info = result.get('user_info', {})
-                st.rerun()
+        flow.redirect_uri = oauth_config['redirect_uri']
         
-        return st.session_state.get('auth_token')
+        auth_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        
+        # Store state in session
+        st.session_state.oauth_state = state
+        
+        return auth_url
+    
+    def handle_oauth_callback(self):
+        """Handle OAuth callback and get tokens"""
+        # Get authorization code from URL parameters
+        query_params = st.experimental_get_query_params()
+        
+        if 'code' in query_params and 'state' in query_params:
+            auth_code = query_params['code'][0]
+            returned_state = query_params['state'][0]
+            
+            # Verify state parameter
+            if st.session_state.get('oauth_state') != returned_state:
+                st.error("❌ Invalid OAuth state parameter")
+                return None
+            
+            try:
+                oauth_config = self.setup_oauth_config()
+                
+                # Create OAuth flow
+                flow = Flow.from_client_config(
+                    {
+                        "web": {
+                            "client_id": oauth_config['client_id'],
+                            "client_secret": oauth_config['client_secret'],
+                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                            "token_uri": "https://oauth2.googleapis.com/token",
+                            "redirect_uris": [oauth_config['redirect_uri']]
+                        }
+                    },
+                    scopes=self.scopes
+                )
+                
+                flow.redirect_uri = oauth_config['redirect_uri']
+                
+                # Exchange authorization code for tokens
+                flow.fetch_token(code=auth_code)
+                
+                # Get credentials
+                creds = flow.credentials
+                
+                # Store tokens in session
+                token_data = {
+                    'access_token': creds.token,
+                    'refresh_token': creds.refresh_token,
+                    'expires_in': 3600  # Default expiry
+                }
+                
+                st.session_state.auth_token = token_data
+                
+                # Get user info
+                try:
+                    user_service = build('oauth2', 'v2', credentials=creds)
+                    user_info = user_service.userinfo().get().execute()
+                    st.session_state.user_info = user_info
+                except:
+                    st.session_state.user_info = {'name': 'User', 'email': 'unknown@example.com'}
+                
+                # Clear query parameters
+                st.experimental_set_query_params()
+                
+                return token_data
+                
+            except Exception as e:
+                st.error(f"❌ OAuth callback error: {str(e)}")
+                return None
+        
+        return None
+    
+    def authenticate_user(self):
+        """Handle Google OAuth authentication with manual implementation"""
+        
+        # Check for OAuth callback first
+        callback_token = self.handle_oauth_callback()
+        if callback_token:
+            st.success("✅ Successfully logged in!")
+            st.experimental_rerun()
+        
+        # Check if user is already authenticated
+        if 'auth_token' in st.session_state:
+            return st.session_state.auth_token
+        
+        # Show login interface
+        st.markdown("### 🔐 Login dengan Google untuk mengakses Drive")
+        st.info("Klik tombol di bawah untuk login dan memberikan akses ke Google Drive Anda")
+        
+        # Generate authorization URL
+        auth_url = self.get_authorization_url()
+        
+        # Custom OAuth button
+        st.markdown(f"""
+        <div style="text-align: center; margin: 2rem 0;">
+            <a href="{auth_url}" target="_self" style="
+                display: inline-block;
+                background: #4285f4;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: bold;
+                font-size: 16px;
+                border: none;
+                cursor: pointer;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            ">
+                🔐 Login dengan Google
+            </a>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        **Catatan:** 
+        - Anda akan diarahkan ke halaman Google untuk login
+        - Setelah login, Anda akan kembali ke aplikasi ini
+        - Aplikasi hanya meminta akses read-only ke Google Drive Anda
+        """)
+        
+        return None
     
     def build_service(self, token):
         """Build Google Drive service with token"""
         try:
+            oauth_config = self.setup_oauth_config()
+            
             creds = Credentials(
                 token=token['access_token'],
                 refresh_token=token.get('refresh_token'),
                 token_uri="https://oauth2.googleapis.com/token",
-                client_id=st.secrets.google.client_id,
-                client_secret=st.secrets.google.client_secret,
+                client_id=oauth_config['client_id'],
+                client_secret=oauth_config['client_secret'],
                 scopes=self.scopes
             )
+            
+            # Refresh token if needed
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                # Update session with new token
+                st.session_state.auth_token['access_token'] = creds.token
             
             self.service = build('drive', 'v3', credentials=creds)
             return True
             
         except Exception as e:
             st.error(f"❌ Error building service: {str(e)}")
+            # Clear invalid token
+            if 'auth_token' in st.session_state:
+                del st.session_state.auth_token
             return False
     
     def get_folder_id_from_url(self, folder_url: str) -> str:
@@ -298,60 +438,73 @@ def display_file_content(content_data: Dict[str, Any]):
         
         # Text content
         if isinstance(content_data['content'], str):
-            st.text_area(
-                "📝 Konten Text:", 
-                content_data['content'], 
-                height=300,
-                key=f"text_{content_data['id']}"
-            )
-            
-            # Word cloud for text
-            if len(content_data['content']) > 100:
-                words = content_data['content'].split()
-                word_freq = pd.Series(words).value_counts().head(10)
-                
-                fig = px.bar(
-                    x=word_freq.values,
-                    y=word_freq.index,
-                    orientation='h',
-                    title="Top 10 Kata Paling Sering",
-                    labels={'x': 'Frekuensi', 'y': 'Kata'}
+            with st.expander("📝 Lihat Konten Text", expanded=True):
+                st.text_area(
+                    "Konten:", 
+                    content_data['content'], 
+                    height=300,
+                    key=f"text_{content_data['id']}"
                 )
-                st.plotly_chart(fig)
+            
+            # Word frequency analysis
+            if len(content_data['content']) > 100:
+                with st.expander("📊 Analisis Kata"):
+                    words = [word.lower().strip('.,!?";()[]{}') for word in content_data['content'].split() 
+                            if len(word) > 3 and word.isalpha()]
+                    if words:
+                        word_freq = pd.Series(words).value_counts().head(10)
+                        
+                        fig = px.bar(
+                            x=word_freq.values,
+                            y=word_freq.index,
+                            orientation='h',
+                            title="Top 10 Kata Paling Sering",
+                            labels={'x': 'Frekuensi', 'y': 'Kata'}
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
         
         # DataFrame content (Excel, CSV)
         elif isinstance(content_data['content'], pd.DataFrame):
-            st.dataframe(content_data['content'])
+            with st.expander("📊 Data Preview", expanded=True):
+                st.dataframe(content_data['content'], use_container_width=True)
             
             # Basic statistics for numeric columns
-            numeric_cols = content_data['content'].select_dtypes(include=['number']).columns
+            numeric_cols = content_data['content'].select_dtypes(include=['number']).columns.tolist()
             if len(numeric_cols) > 0:
-                st.subheader("📊 Statistik Dasar")
-                st.dataframe(content_data['content'][numeric_cols].describe())
+                with st.expander("📈 Statistik Dasar"):
+                    st.dataframe(content_data['content'][numeric_cols].describe())
                 
                 # Simple visualization
                 if len(numeric_cols) >= 2:
+                    st.subheader("📊 Visualisasi Data")
                     col1, col2 = st.columns(2)
                     with col1:
                         x_col = st.selectbox("X-axis", numeric_cols, key=f"x_{content_data['id']}")
                     with col2:
                         y_col = st.selectbox("Y-axis", numeric_cols, key=f"y_{content_data['id']}")
                     
-                    if x_col and y_col:
-                        fig = px.scatter(content_data['content'], x=x_col, y=y_col)
-                        st.plotly_chart(fig)
+                    if x_col and y_col and x_col != y_col:
+                        fig = px.scatter(
+                            content_data['content'], 
+                            x=x_col, 
+                            y=y_col,
+                            title=f"{x_col} vs {y_col}"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
         
         # List content (CSV rows)
         elif isinstance(content_data['content'], list):
             if content_data['content']:
-                df = pd.DataFrame(content_data['content'])
-                st.dataframe(df)
+                with st.expander("📋 Data Table", expanded=True):
+                    df = pd.DataFrame(content_data['content'])
+                    st.dataframe(df, use_container_width=True)
             else:
                 st.info("📄 File kosong")
         
         # JSON content
         elif isinstance(content_data['content'], dict):
-            st.json(content_data['content'])
+            with st.expander("🔍 JSON Content", expanded=True):
+                st.json(content_data['content'])
     
     st.divider()
 
@@ -362,7 +515,8 @@ def main():
     st.set_page_config(
         page_title="Google Drive Reader",
         page_icon="📁",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
     
     # Custom CSS
@@ -370,18 +524,30 @@ def main():
     <style>
     .main-header {
         background: linear-gradient(90deg, #4285f4, #34a853, #fbbc05, #ea4335);
-        padding: 1rem;
+        padding: 1.5rem;
         border-radius: 10px;
         color: white;
         text-align: center;
         margin-bottom: 2rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     }
-    .file-card {
-        background: #f8f9fa;
-        padding: 1rem;
+    .stButton > button {
+        background: linear-gradient(90deg, #4285f4, #34a853);
+        color: white;
+        border: none;
         border-radius: 8px;
-        border-left: 4px solid #4285f4;
-        margin: 0.5rem 0;
+        padding: 0.5rem 2rem;
+        font-weight: bold;
+    }
+    .oauth-button {
+        background: #4285f4 !important;
+        color: white !important;
+        padding: 12px 24px !important;
+        border-radius: 8px !important;
+        text-decoration: none !important;
+        font-weight: bold !important;
+        display: inline-block !important;
+        margin: 1rem 0 !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -401,23 +567,43 @@ def main():
     token = reader.authenticate_user()
     
     if not token:
+        st.info("""
+        **🔐 Langkah untuk menggunakan aplikasi ini:**
+        
+        1. Klik tombol "Login dengan Google" di atas
+        2. Pilih akun Google Anda
+        3. Berikan izin akses ke Google Drive (read-only)
+        4. Anda akan diarahkan kembali ke aplikasi
+        
+        **🔒 Keamanan:**
+        - Aplikasi hanya meminta akses read-only
+        - Tidak ada data yang disimpan di server
+        - Anda dapat mencabut akses kapan saja di Google Account Settings
+        """)
         st.stop()
     
     # Build service
     if not reader.build_service(token):
-        st.stop()
-    
-    # User info
-    if 'user_info' in st.session_state:
-        user_info = st.session_state.user_info
-        st.sidebar.success(f"👋 Hello, {user_info.get('name', 'User')}!")
-        
-        # Logout button
-        if st.sidebar.button("🚪 Logout"):
-            for key in ['auth_token', 'user_info']:
+        st.error("❌ Gagal terhubung ke Google Drive. Silakan login ulang.")
+        if st.button("🔄 Login Ulang"):
+            for key in ['auth_token', 'user_info', 'oauth_state']:
                 if key in st.session_state:
                     del st.session_state[key]
-            st.rerun()
+            st.experimental_rerun()
+        st.stop()
+    
+    # User info in sidebar
+    if 'user_info' in st.session_state:
+        user_info = st.session_state.user_info
+        with st.sidebar:
+            st.success(f"👋 Hello, {user_info.get('name', 'User')}!")
+            st.write(f"📧 {user_info.get('email', '')}")
+            
+            if st.button("🚪 Logout", type="secondary"):
+                for key in ['auth_token', 'user_info', 'oauth_state']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.experimental_rerun()
     
     # Main interface
     st.sidebar.header("⚙️ Pengaturan")
@@ -425,7 +611,8 @@ def main():
     # Mode selection
     mode = st.sidebar.radio(
         "Pilih mode:",
-        ["📁 Baca Folder", "📄 Baca Single File"]
+        ["📁 Baca Folder", "📄 Baca Single File"],
+        help="Pilih apakah ingin membaca seluruh folder atau file individual"
     )
     
     if mode == "📁 Baca Folder":
@@ -433,14 +620,14 @@ def main():
         
         folder_url = st.text_input(
             "🔗 URL Folder Google Drive:",
-            placeholder="https://drive.google.com/drive/folders/...",
-            help="Paste URL folder Google Drive yang ingin dibaca"
+            placeholder="https://drive.google.com/drive/folders/1a2b3c4d5e6f...",
+            help="Copy URL folder dari address bar browser saat membuka folder di Google Drive"
         )
         
         if st.button("🚀 Baca Folder", type="primary"):
-            if folder_url:
+            if folder_url.strip():
                 try:
-                    with st.spinner("📂 Membaca folder..."):
+                    with st.spinner("📂 Menganalisis folder..."):
                         folder_id = reader.get_folder_id_from_url(folder_url)
                         files = reader.list_files_in_folder(folder_id)
                     
@@ -448,41 +635,84 @@ def main():
                         st.success(f"✅ Ditemukan {len(files)} file dalam folder")
                         
                         # Filter options
-                        st.sidebar.subheader("🔍 Filter")
+                        st.sidebar.subheader("🔍 Filter File")
                         file_types = list(set([f['mimeType'] for f in files]))
-                        selected_types = st.sidebar.multiselect(
-                            "Tipe file:",
-                            file_types,
-                            default=file_types
+                        readable_types = []
+                        for ft in file_types:
+                            if 'google-apps' in ft:
+                                readable_types.append(ft.split('.')[-1].title())
+                            else:
+                                readable_types.append(ft.split('/')[-1].upper())
+                        
+                        type_mapping = dict(zip(readable_types, file_types))
+                        
+                        selected_readable = st.sidebar.multiselect(
+                            "Pilih tipe file:",
+                            readable_types,
+                            default=readable_types,
+                            help="Filter file berdasarkan tipe yang ingin dibaca"
                         )
+                        
+                        selected_types = [type_mapping[rt] for rt in selected_readable]
                         
                         # Filter files
                         filtered_files = [f for f in files if f['mimeType'] in selected_types]
                         
-                        # Progress bar
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        # Read files
-                        results = []
-                        for i, file in enumerate(filtered_files):
-                            if file['mimeType'] != 'application/vnd.google-apps.folder':
-                                status_text.text(f"📖 Membaca: {file['name']}")
-                                content = reader.read_file_content(file)
-                                results.append(content)
-                                progress_bar.progress((i + 1) / len(filtered_files))
-                        
-                        status_text.text("✅ Selesai!")
-                        
-                        # Display results
-                        st.header(f"📊 Hasil Pembacaan ({len(results)} files)")
-                        
-                        for content_data in results:
-                            display_file_content(content_data)
+                        if filtered_files:
+                            # Show file list
+                            with st.expander(f"📋 Daftar File ({len(filtered_files)} file)", expanded=False):
+                                for i, file in enumerate(filtered_files, 1):
+                                    file_type = file['mimeType'].split('/')[-1]
+                                    st.write(f"{i}. **{file['name']}** ({file_type})")
+                            
+                            # Processing options
+                            process_all = st.checkbox(
+                                "📖 Baca semua file sekaligus", 
+                                value=True,
+                                help="Uncheck jika hanya ingin melihat daftar file"
+                            )
+                            
+                            if process_all:
+                                # Progress bar
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                # Read files
+                                results = []
+                                for i, file in enumerate(filtered_files):
+                                    if file['mimeType'] != 'application/vnd.google-apps.folder':
+                                        status_text.text(f"📖 Membaca: {file['name']} ({i+1}/{len(filtered_files)})")
+                                        content = reader.read_file_content(file)
+                                        results.append(content)
+                                        progress_bar.progress((i + 1) / len(filtered_files))
+                                
+                                status_text.text("✅ Selesai membaca semua file!")
+                                progress_bar.empty()
+                                
+                                # Display results
+                                if results:
+                                    st.header(f"📊 Hasil Pembacaan ({len(results)} files)")
+                                    
+                                    # Summary statistics
+                                    successful = len([r for r in results if r['content'] and not r['error']])
+                                    failed = len(results) - successful
+                                    
+                                    col1, col2, col3 = st.columns(3)
+                                    col1.metric("✅ Berhasil", successful)
+                                    col2.metric("❌ Gagal", failed)
+                                    col3.metric("📊 Total", len(results))
+                                    
+                                    # Display each file
+                                    for content_data in results:
+                                        display_file_content(content_data)
+                        else:
+                            st.warning("🔍 Tidak ada file dengan tipe yang dipilih")
                         
                     else:
-                        st.warning("📁 Folder kosong atau tidak dapat diakses")
+                        st.warning("📁 Folder kosong atau tidak dapat diakses. Pastikan folder dapat diakses secara public atau Anda memiliki izin akses.")
                         
+                except ValueError as ve:
+                    st.error(f"❌ {str(ve)}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
             else:
@@ -493,12 +723,12 @@ def main():
         
         file_url = st.text_input(
             "🔗 URL File Google Drive:",
-            placeholder="https://drive.google.com/file/d/...",
-            help="Paste URL file Google Drive yang ingin dibaca"
+            placeholder="https://drive.google.com/file/d/1a2b3c4d5e6f.../view",
+            help="Copy URL file dari address bar browser saat membuka file di Google Drive"
         )
         
         if st.button("📖 Baca File", type="primary"):
-            if file_url:
+            if file_url.strip():
                 try:
                     with st.spinner("📄 Membaca file..."):
                         file_id = reader.get_file_id_from_url(file_url)
@@ -513,20 +743,38 @@ def main():
                     
                     display_file_content(content_data)
                     
+                except ValueError as ve:
+                    st.error(f"❌ {str(ve)}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
             else:
                 st.warning("⚠️ Masukkan URL file terlebih dahulu")
     
-    # Footer
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("""
-    **📋 Format yang didukung:**
-    - Google Docs & Sheets
-    - PDF, Word, Excel
-    - Text, CSV, JSON
-    - Dan lainnya...
-    """)
+    # Footer information
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("""
+        **📋 Format yang didukung:**
+        - 📝 Google Docs → Text
+        - 📊 Google Sheets → CSV/Table
+        - 📄 PDF → Extracted text
+        - 📄 Word (.docx) → Text
+        - 📊 Excel (.xlsx) → Table
+        - 📝 Text files → Raw text
+        - 📊 CSV → Table
+        - 🔧 JSON → Structured data
+        
+        **🔒 Privasi & Keamanan:**
+        - Akses read-only saja
+        - Data tidak disimpan di server
+        - Koneksi aman via HTTPS
+        - Anda dapat revoke akses kapan saja
+        
+        **💡 Tips Penggunaan:**
+        - File harus dapat diakses oleh akun Google Anda
+        - Untuk file besar, proses mungkin memakan waktu
+        - Gunakan filter untuk membatasi jenis file
+        """)
 
 if __name__ == "__main__":
     main()
