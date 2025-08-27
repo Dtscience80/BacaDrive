@@ -3,7 +3,7 @@ Streamlit Google Drive Reader App - Fixed Version
 Web aplikasi untuk membaca file dan folder Google Drive menggunakan Google OAuth
 
 Requirements:
-pip install streamlit google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client python-docx openpyxl PyPDF2 pandas plotly streamlit-components-custom
+pip install streamlit google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client python-docx openpyxl PyPDF2 pandas plotly streamlit-authenticator
 """
 
 import streamlit as st
@@ -31,7 +31,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 class StreamlitGoogleDriveReader:
-    """Streamlit Google Drive Reader with Manual OAuth Implementation"""
+    """Streamlit Google Drive Reader with Fixed OAuth Implementation"""
     
     def __init__(self):
         self.scopes = [
@@ -44,21 +44,33 @@ class StreamlitGoogleDriveReader:
     def get_base_url(self):
         """Get the base URL for the app"""
         try:
-            # Try to detect Streamlit Cloud
-            if 'STREAMLIT_SHARING' in os.environ or 'streamlit.app' in str(st.get_option('server.baseUrlPath')):
-                # For Streamlit Cloud, construct URL from environment or use a default
-                app_name = os.environ.get('STREAMLIT_APP_NAME', 'your-app-name')
-                return f"https://{app_name}.streamlit.app"
-            else:
-                return "http://localhost:8501"
-        except:
+            # Check if running on Streamlit Cloud
+            if hasattr(st, 'get_option'):
+                server_config = st.get_option('server')
+                if server_config:
+                    port = getattr(server_config, 'port', 8501)
+                    if port != 8501:  # Streamlit Cloud uses different ports
+                        # Try to get the actual URL from environment
+                        if 'STREAMLIT_SERVER_URL' in os.environ:
+                            return os.environ['STREAMLIT_SERVER_URL']
+                        # Check for Streamlit Cloud specific environment variables
+                        elif any(key in os.environ for key in ['STREAMLIT_SHARING', 'STREAMLIT_CLOUD']):
+                            app_name = os.environ.get('STREAMLIT_APP_NAME', 'your-app-name')
+                            username = os.environ.get('STREAMLIT_USER_NAME', 'username')
+                            return f"https://{username}-{app_name}-streamlit-app-xxxxxx.streamlit.app"
+            
+            # Default to localhost for local development
+            return "http://localhost:8501"
+            
+        except Exception as e:
+            st.warning(f"Could not determine base URL: {e}. Using localhost.")
             return "http://localhost:8501"
         
     def setup_oauth_config(self):
         """Setup OAuth configuration dari Streamlit secrets"""
         if 'google' not in st.secrets:
             st.error("""
-            ❌ **Google OAuth belum dikonfigurasi!**
+            ⚠️ **Google OAuth belum dikonfigurasi!**
             
             Tambahkan konfigurasi berikut ke Streamlit secrets:
             
@@ -69,10 +81,20 @@ class StreamlitGoogleDriveReader:
             ```
             
             **Setup Instructions:**
-            1. Buka Google Cloud Console
-            2. Buat OAuth2 credentials (Web Application)
-            3. Tambahkan authorized redirect URI: `{self.get_base_url()}`
-            4. Copy client_id dan client_secret ke Streamlit secrets
+            1. Buka [Google Cloud Console](https://console.cloud.google.com/)
+            2. Buat project baru atau pilih existing project
+            3. Aktifkan Google Drive API dan Google+ API
+            4. Buat OAuth2 credentials (Web Application)
+            5. Tambahkan authorized redirect URIs:
+               - `http://localhost:8501` (untuk development)
+               - URL Streamlit Cloud app Anda (untuk production)
+            6. Copy client_id dan client_secret ke Streamlit secrets
+            
+            **Authorized Redirect URIs yang perlu ditambahkan:**
+            ```
+            http://localhost:8501
+            https://your-app-name.streamlit.app
+            ```
             """)
             st.stop()
             
@@ -87,67 +109,82 @@ class StreamlitGoogleDriveReader:
     
     def get_authorization_url(self):
         """Generate OAuth authorization URL"""
-        oauth_config = self.setup_oauth_config()
-        
-        # Create OAuth flow
-        flow = Flow.from_client_config(
-            {
+        try:
+            oauth_config = self.setup_oauth_config()
+            
+            # Create OAuth flow dengan client config yang benar
+            client_config = {
                 "web": {
                     "client_id": oauth_config['client_id'],
                     "client_secret": oauth_config['client_secret'],
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                     "redirect_uris": [oauth_config['redirect_uri']]
                 }
-            },
-            scopes=self.scopes
-        )
-        
-        flow.redirect_uri = oauth_config['redirect_uri']
-        
-        auth_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true',
-            prompt='consent'
-        )
-        
-        # Store state in session
-        st.session_state.oauth_state = state
-        
-        return auth_url
+            }
+            
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=self.scopes
+            )
+            
+            flow.redirect_uri = oauth_config['redirect_uri']
+            
+            # Generate authorization URL dengan parameter yang benar
+            auth_url, state = flow.authorization_url(
+                access_type='offline',
+                include_granted_scopes='true',
+                prompt='consent'
+            )
+            
+            # Store state in session
+            st.session_state.oauth_state = state
+            st.session_state.oauth_flow = flow  # Store flow for later use
+            
+            return auth_url
+            
+        except Exception as e:
+            st.error(f"Error generating authorization URL: {str(e)}")
+            return None
     
     def handle_oauth_callback(self):
         """Handle OAuth callback and get tokens"""
-        # Get authorization code from URL parameters
-        query_params = st.experimental_get_query_params()
-        
-        if 'code' in query_params and 'state' in query_params:
-            auth_code = query_params['code'][0]
-            returned_state = query_params['state'][0]
+        try:
+            # Get authorization code from URL parameters
+            query_params = st.query_params
             
-            # Verify state parameter
-            if st.session_state.get('oauth_state') != returned_state:
-                st.error("❌ Invalid OAuth state parameter")
-                return None
-            
-            try:
-                oauth_config = self.setup_oauth_config()
+            if 'code' in query_params and 'state' in query_params:
+                auth_code = query_params['code']
+                returned_state = query_params['state']
                 
-                # Create OAuth flow
-                flow = Flow.from_client_config(
-                    {
+                # Verify state parameter
+                if st.session_state.get('oauth_state') != returned_state:
+                    st.error("⚠️ Invalid OAuth state parameter")
+                    return None
+                
+                # Use stored flow if available
+                if 'oauth_flow' in st.session_state:
+                    flow = st.session_state.oauth_flow
+                else:
+                    # Recreate flow
+                    oauth_config = self.setup_oauth_config()
+                    client_config = {
                         "web": {
                             "client_id": oauth_config['client_id'],
                             "client_secret": oauth_config['client_secret'],
                             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                             "token_uri": "https://oauth2.googleapis.com/token",
+                            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                             "redirect_uris": [oauth_config['redirect_uri']]
                         }
-                    },
-                    scopes=self.scopes
-                )
-                
-                flow.redirect_uri = oauth_config['redirect_uri']
+                    }
+                    
+                    flow = Flow.from_client_config(
+                        client_config,
+                        scopes=self.scopes
+                    )
+                    flow.redirect_uri = oauth_config['redirect_uri']
                 
                 # Exchange authorization code for tokens
                 flow.fetch_token(code=auth_code)
@@ -159,7 +196,10 @@ class StreamlitGoogleDriveReader:
                 token_data = {
                     'access_token': creds.token,
                     'refresh_token': creds.refresh_token,
-                    'expires_in': 3600  # Default expiry
+                    'token_uri': creds.token_uri,
+                    'client_id': creds.client_id,
+                    'client_secret': creds.client_secret,
+                    'scopes': creds.scopes
                 }
                 
                 st.session_state.auth_token = token_data
@@ -169,17 +209,20 @@ class StreamlitGoogleDriveReader:
                     user_service = build('oauth2', 'v2', credentials=creds)
                     user_info = user_service.userinfo().get().execute()
                     st.session_state.user_info = user_info
-                except:
+                except Exception as e:
+                    st.warning(f"Could not get user info: {e}")
                     st.session_state.user_info = {'name': 'User', 'email': 'unknown@example.com'}
                 
-                # Clear query parameters
-                st.experimental_set_query_params()
+                # Clear query parameters and OAuth flow
+                st.query_params.clear()
+                if 'oauth_flow' in st.session_state:
+                    del st.session_state.oauth_flow
                 
                 return token_data
                 
-            except Exception as e:
-                st.error(f"❌ OAuth callback error: {str(e)}")
-                return None
+        except Exception as e:
+            st.error(f"⚠️ OAuth callback error: {str(e)}")
+            return None
         
         return None
     
@@ -190,7 +233,7 @@ class StreamlitGoogleDriveReader:
         callback_token = self.handle_oauth_callback()
         if callback_token:
             st.success("✅ Successfully logged in!")
-            st.experimental_rerun()
+            st.rerun()
         
         # Check if user is already authenticated
         if 'auth_token' in st.session_state:
@@ -198,53 +241,93 @@ class StreamlitGoogleDriveReader:
         
         # Show login interface
         st.markdown("### 🔐 Login dengan Google untuk mengakses Drive")
-        st.info("Klik tombol di bawah untuk login dan memberikan akses ke Google Drive Anda")
         
         # Generate authorization URL
         auth_url = self.get_authorization_url()
         
-        # Custom OAuth button
-        st.markdown(f"""
-        <div style="text-align: center; margin: 2rem 0;">
-            <a href="{auth_url}" target="_self" style="
-                display: inline-block;
-                background: #4285f4;
-                color: white;
-                padding: 12px 24px;
-                border-radius: 8px;
-                text-decoration: none;
-                font-weight: bold;
-                font-size: 16px;
-                border: none;
-                cursor: pointer;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-            ">
-                🔐 Login dengan Google
-            </a>
-        </div>
-        """, unsafe_allow_html=True)
+        if auth_url:
+            st.info("""
+            **Langkah untuk login:**
+            1. Klik tombol "Login dengan Google" di bawah
+            2. Anda akan diarahkan ke halaman Google
+            3. Login dengan akun Google Anda
+            4. Berikan izin akses ke Google Drive
+            5. Anda akan kembali ke aplikasi ini
+            """)
+            
+            # Custom OAuth button
+            st.markdown(f"""
+            <div style="text-align: center; margin: 2rem 0;">
+                <a href="{auth_url}" target="_self" style="
+                    display: inline-block;
+                    background: #4285f4;
+                    color: white;
+                    padding: 12px 24px;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    font-weight: bold;
+                    font-size: 16px;
+                    border: none;
+                    cursor: pointer;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                    transition: background-color 0.3s;
+                ">
+                    🔐 Login dengan Google
+                </a>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Debug information
+            if st.checkbox("🔧 Show Debug Info"):
+                st.write("**Current Base URL:**", self.get_base_url())
+                st.write("**OAuth Config:**")
+                config = self.setup_oauth_config()
+                st.json({
+                    "client_id": config['client_id'][:20] + "...",
+                    "redirect_uri": config['redirect_uri']
+                })
         
-        st.markdown("""
-        **Catatan:** 
-        - Anda akan diarahkan ke halaman Google untuk login
-        - Setelah login, Anda akan kembali ke aplikasi ini
-        - Aplikasi hanya meminta akses read-only ke Google Drive Anda
-        """)
+        # Troubleshooting section
+        with st.expander("❓ Mengalami masalah login?"):
+            st.markdown("""
+            **Kemungkinan penyebab error 403:**
+            
+            1. **Redirect URI tidak cocok:**
+               - Pastikan di Google Cloud Console, Authorized Redirect URIs sudah benar
+               - Untuk localhost: `http://localhost:8501`
+               - Untuk Streamlit Cloud: URL lengkap aplikasi Anda
+            
+            2. **APIs belum diaktifkan:**
+               - Google Drive API
+               - Google+ API (atau People API)
+            
+            3. **OAuth Screen belum dikonfigurasi:**
+               - Buka OAuth consent screen di Google Cloud Console
+               - Atur sebagai "External" jika untuk testing
+               - Tambahkan test users jika diperlukan
+            
+            **Langkah troubleshooting:**
+            1. Buka [Google Cloud Console](https://console.cloud.google.com/)
+            2. Pilih project yang benar
+            3. Ke "APIs & Services" > "Credentials"
+            4. Edit OAuth 2.0 Client IDs
+            5. Pastikan Authorized redirect URIs sudah benar
+            6. Ke "APIs & Services" > "Library"
+            7. Aktifkan Google Drive API dan Google+ API
+            """)
         
         return None
     
     def build_service(self, token):
         """Build Google Drive service with token"""
         try:
-            oauth_config = self.setup_oauth_config()
-            
             creds = Credentials(
                 token=token['access_token'],
                 refresh_token=token.get('refresh_token'),
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=oauth_config['client_id'],
-                client_secret=oauth_config['client_secret'],
-                scopes=self.scopes
+                token_uri=token.get('token_uri', "https://oauth2.googleapis.com/token"),
+                client_id=token.get('client_id'),
+                client_secret=token.get('client_secret'),
+                scopes=token.get('scopes', self.scopes)
             )
             
             # Refresh token if needed
@@ -257,10 +340,12 @@ class StreamlitGoogleDriveReader:
             return True
             
         except Exception as e:
-            st.error(f"❌ Error building service: {str(e)}")
+            st.error(f"⚠️ Error building service: {str(e)}")
             # Clear invalid token
             if 'auth_token' in st.session_state:
                 del st.session_state.auth_token
+            if 'user_info' in st.session_state:
+                del st.session_state.user_info
             return False
     
     def get_folder_id_from_url(self, folder_url: str) -> str:
@@ -292,7 +377,7 @@ class StreamlitGoogleDriveReader:
             return results.get('files', [])
             
         except HttpError as error:
-            st.error(f"❌ Error: {error}")
+            st.error(f"⚠️ Error: {error}")
             return []
     
     def download_file(self, file_id: str) -> Optional[bytes]:
@@ -310,7 +395,7 @@ class StreamlitGoogleDriveReader:
             return file_io.read()
             
         except HttpError as error:
-            st.error(f"❌ Error downloading file: {error}")
+            st.error(f"⚠️ Error downloading file: {error}")
             return None
     
     def export_google_doc(self, file_id: str, export_type: str = 'text/plain') -> Optional[str]:
@@ -328,7 +413,7 @@ class StreamlitGoogleDriveReader:
             return file_io.read().decode('utf-8')
             
         except HttpError as error:
-            st.error(f"❌ Error exporting file: {error}")
+            st.error(f"⚠️ Error exporting file: {error}")
             return None
     
     def read_file_content(self, file_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -429,7 +514,7 @@ def display_file_content(content_data: Dict[str, Any]):
             st.markdown(f"🔗 [Buka di Drive]({content_data['web_link']})")
     with col3:
         if content_data['error']:
-            st.error(f"❌ {content_data['error']}")
+            st.error(f"⚠️ {content_data['error']}")
         else:
             st.success("✅ Berhasil dibaca")
     
@@ -438,7 +523,7 @@ def display_file_content(content_data: Dict[str, Any]):
         
         # Text content
         if isinstance(content_data['content'], str):
-            with st.expander("📝 Lihat Konten Text", expanded=True):
+            with st.expander("📖 Lihat Konten Text", expanded=True):
                 st.text_area(
                     "Konten:", 
                     content_data['content'], 
@@ -503,7 +588,7 @@ def display_file_content(content_data: Dict[str, Any]):
         
         # JSON content
         elif isinstance(content_data['content'], dict):
-            with st.expander("🔍 JSON Content", expanded=True):
+            with st.expander("📝 JSON Content", expanded=True):
                 st.json(content_data['content'])
     
     st.divider()
@@ -514,7 +599,7 @@ def main():
     # Page config
     st.set_page_config(
         page_title="Google Drive Reader",
-        page_icon="📁",
+        page_icon="📖",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -555,7 +640,7 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>📁 Google Drive Reader</h1>
+        <h1>📖 Google Drive Reader</h1>
         <p>Baca dan analisis file dari Google Drive Anda dengan mudah</p>
     </div>
     """, unsafe_allow_html=True)
@@ -567,29 +652,16 @@ def main():
     token = reader.authenticate_user()
     
     if not token:
-        st.info("""
-        **🔐 Langkah untuk menggunakan aplikasi ini:**
-        
-        1. Klik tombol "Login dengan Google" di atas
-        2. Pilih akun Google Anda
-        3. Berikan izin akses ke Google Drive (read-only)
-        4. Anda akan diarahkan kembali ke aplikasi
-        
-        **🔒 Keamanan:**
-        - Aplikasi hanya meminta akses read-only
-        - Tidak ada data yang disimpan di server
-        - Anda dapat mencabut akses kapan saja di Google Account Settings
-        """)
         st.stop()
     
     # Build service
     if not reader.build_service(token):
-        st.error("❌ Gagal terhubung ke Google Drive. Silakan login ulang.")
+        st.error("⚠️ Gagal terhubung ke Google Drive. Silakan login ulang.")
         if st.button("🔄 Login Ulang"):
-            for key in ['auth_token', 'user_info', 'oauth_state']:
+            for key in ['auth_token', 'user_info', 'oauth_state', 'oauth_flow']:
                 if key in st.session_state:
                     del st.session_state[key]
-            st.experimental_rerun()
+            st.rerun()
         st.stop()
     
     # User info in sidebar
@@ -600,10 +672,10 @@ def main():
             st.write(f"📧 {user_info.get('email', '')}")
             
             if st.button("🚪 Logout", type="secondary"):
-                for key in ['auth_token', 'user_info', 'oauth_state']:
+                for key in ['auth_token', 'user_info', 'oauth_state', 'oauth_flow']:
                     if key in st.session_state:
                         del st.session_state[key]
-                st.experimental_rerun()
+                st.rerun()
     
     # Main interface
     st.sidebar.header("⚙️ Pengaturan")
@@ -699,7 +771,7 @@ def main():
                                     
                                     col1, col2, col3 = st.columns(3)
                                     col1.metric("✅ Berhasil", successful)
-                                    col2.metric("❌ Gagal", failed)
+                                    col2.metric("⚠️ Gagal", failed)
                                     col3.metric("📊 Total", len(results))
                                     
                                     # Display each file
@@ -712,9 +784,9 @@ def main():
                         st.warning("📁 Folder kosong atau tidak dapat diakses. Pastikan folder dapat diakses secara public atau Anda memiliki izin akses.")
                         
                 except ValueError as ve:
-                    st.error(f"❌ {str(ve)}")
+                    st.error(f"⚠️ {str(ve)}")
                 except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                    st.error(f"⚠️ Error: {str(e)}")
             else:
                 st.warning("⚠️ Masukkan URL folder terlebih dahulu")
     
@@ -744,9 +816,9 @@ def main():
                     display_file_content(content_data)
                     
                 except ValueError as ve:
-                    st.error(f"❌ {str(ve)}")
+                    st.error(f"⚠️ {str(ve)}")
                 except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                    st.error(f"⚠️ Error: {str(e)}")
             else:
                 st.warning("⚠️ Masukkan URL file terlebih dahulu")
     
@@ -762,9 +834,9 @@ def main():
         - 📊 Excel (.xlsx) → Table
         - 📝 Text files → Raw text
         - 📊 CSV → Table
-        - 🔧 JSON → Structured data
+        - 📧 JSON → Structured data
         
-        **🔒 Privasi & Keamanan:**
+        **🔐 Privasi & Keamanan:**
         - Akses read-only saja
         - Data tidak disimpan di server
         - Koneksi aman via HTTPS
