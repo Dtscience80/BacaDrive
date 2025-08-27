@@ -1,0 +1,28 @@
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials (JANGAN commit ini!)
+credentials.json
+token.json
+client_secret*.json
